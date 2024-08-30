@@ -3,6 +3,16 @@ name = "notary-server"
 version = "0.1.0-alpha.6"
 edition = "2021"
 
+[features]
+reports = [
+    "dep:mc-sgx-core-types",
+"dep:mc-sgx-dcap-ql",
+"dep:mc-sgx-dcap-quoteverify",
+"dep:mc-sgx-dcap-types",
+    ]
+
+
+
 [dependencies]
 tlsn-common = { workspace = true }
 tlsn-verifier = { workspace = true }
@@ -44,3 +54,20 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 uuid = { workspace = true, features = ["v4", "fast-rng"] }
 ws_stream_tungstenite = { workspace = true, features = ["tokio_io"] }
+mc-sgx-core-types = { version = "0.11.0", optional = true }
+mc-sgx-dcap-ql = { version = "0.11.0", optional = true }
+mc-sgx-dcap-quoteverify = { version = "0.11.0", optional = true }
+mc-sgx-dcap-types = { version = "0.11.0", optional = true }
+
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=skylake", '--cfg=curve25519_dalek_backend="simd"', '--cfg=feature="precomputed-tables"']
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-cpu=skylake", '--cfg=curve25519_dalek_backend="simd"', '--cfg=feature="precomputed-tables"']
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=skylake", '--cfg=curve25519_dalek_backend="simd"', '--cfg=feature="precomputed-tables"']
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=skylake", '--cfg=curve25519_dalek_backend="simd"', '--cfg=feature="precomputed-tables"']

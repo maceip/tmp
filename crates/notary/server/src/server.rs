@@ -41,6 +41,7 @@ use crate::{
     middleware::AuthorizationMiddleware,
     service::{initialize, upgrade_protocol},
     util::parse_csv_file,
+    report::Generate,
 };
 
 /// Start a TCP server (with or without TLS) to accept notarization request for both TCP and WebSocket clients
@@ -152,7 +153,8 @@ pub async fn run_server(config: &NotaryServerProperties) -> Result<(), NotarySer
             NotaryGlobals,
         >(notary_globals.clone()))
         .route("/notarize", get(upgrade_protocol))
-        .layer(CorsLayer::permissive())
+        .route("/report", get(Generate))
+         .layer(CorsLayer::permissive())
         .with_state(notary_globals);
 
     loop {

@@ -6,6 +6,7 @@ mod server;
 mod server_tracing;
 mod service;
 mod util;
+mod report;
 
 pub use config::{
     AuthorizationProperties, LoggingProperties, NotarizationProperties, NotaryServerProperties,
