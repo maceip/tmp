@@ -1,348 +1,439 @@
-# Security Audit Report: TLSNotary TLS Client & Cryptographic Implementation
+# TLSNotary Security Audit Report
 
 **Date:** 2026-07-24
-**Scope:** TLS client state machine, backends, crypto operations, proof verification, session types
-**Exclusions:** Previously reported findings (EMS not applied, OCSP stapling ignored, debug `println!` with key material, prover doesn't verify notary signature, unsigned `server_name` in `SessionProof`)
+**Scope:** WASM bindings, formats/selective disclosure, data parsing, Merkle tree, transcript handling, substring proofs, serde patterns
+**Exclusions:** Findings already documented (WASM bincode size limits, selective disclosure control character injection, offline HandshakeSummary::verify() missing, SessionHeader sent_len/recv_len not verified)
 
 ---
 
-## Finding 1: Decryption Failure Causes Panic (Denial of Service)
+## Finding 1: MerkleProof.verify() Uses `assert!` Instead of Returning Errors — Panic-Based DoS
 
 **Severity:** High
-**File:** `crates/tls/client/src/crypto/standard.rs`, lines 655-660
-**Category:** Implementation Bug / Denial of Service
+**File:** `crates/core/src/merkle.rs`, lines 72–81
+**Category:** Denial of Service via panic in verification path
 
 ### Description
 
-The `StandardCrypto::Decrypter::decrypt_aes128gcm` method calls `.unwrap()` on the AES-GCM decryption result. If a malicious server or network attacker sends a corrupted ciphertext that fails AEAD authentication, this causes an unrecoverable panic, crashing the entire process.
+`MerkleProof::verify()` uses `assert_eq!` and `assert!` to validate preconditions (matching lengths of `leaf_indices`/`leaf_hashes`, and checking for duplicate indices). These will **panic** and abort the process/WASM instance instead of returning a `Result::Err`.
 
-### Evidence
-
-```
-655|        let cipher = Aes128Gcm::new_from_slice(&self.write_key).unwrap();
-...
-660|        let plaintext = cipher.decrypt(nonce, aes_payload).unwrap();
-```
-
-In contrast, the `RustCryptoBackend` version in `crates/tls/client/src/backend/standard.rs` (line 534-536) correctly propagates the error:
-```
-534|        let plaintext = cipher
-535|            .decrypt(nonce, aes_payload)
-536|            .map_err(|e| BackendError::DecryptionError(e.to_string()))?;
+```rust
+pub fn verify(
+    &self,
+    root: &MerkleRoot,
+    leaf_indices: &[usize],
+    leaf_hashes: &[Hash],
+) -> Result<(), MerkleError> {
+    assert_eq!(
+        leaf_indices.len(),
+        leaf_hashes.len(),
+        "leaf indices length must match leaf hashes length"
+    );
+    assert!(
+        !leaf_indices.iter().contains_dups(),
+        "duplicate indices provided {:?}",
+        leaf_indices
+    );
+    // ...
+}
 ```
 
 ### Attack Chain
 
-1. Attacker performs a network-level MITM or the TLS server sends malformed encrypted data.
-2. The corrupted ciphertext arrives at the client.
-3. `decrypt_aes128gcm` is called, AES-GCM authentication fails.
-4. `.unwrap()` is called on the `Err` result.
-5. The process panics and terminates.
+1. An attacker crafts a malicious `SubstringsProof` (via deserialized bytes) where the commitment openings produce duplicate `CommitmentId` indices when collected in `SubstringsProof::verify()` (line 279 of `substrings.rs`: `indices.push(id.to_inner() as usize)`).
+2. During `SubstringsProof::verify()`, when `inclusion_proof.verify()` is called at line 307, the duplicate indices trigger `assert!(!leaf_indices.iter().contains_dups(), ...)`.
+3. This panics the entire WASM instance or Rust process, causing a denial of service.
 
-This is also present in the encryption path at line 602:
+Note: `SubstringsProof::verify()` iterates over a `HashMap<CommitmentId, ...>`, which should produce unique keys. However, the `CommitmentId` is a `u32` wrapper, and the duplicate check exists as a defense-in-depth mechanism that **should** use `Result::Err` rather than `assert!` to avoid giving an attacker a guaranteed crash path if any upstream invariant is violated.
+
+The `MerkleTree::proof()` method at line 162 also uses `assert!` for sorted indices, which is similarly problematic if that function is reachable with untrusted input.
+
+### Evidence
+
+- `crates/core/src/merkle.rs:72-81` — assert macros in `verify()`
+- `crates/core/src/merkle.rs:162-164` — assert in `proof()`
+- `crates/core/src/proof/substrings.rs:306-308` — caller site
+
+### Recommendation
+
+Replace `assert!` / `assert_eq!` with proper error returns:
+
+```rust
+if leaf_indices.len() != leaf_hashes.len() {
+    return Err(MerkleError::LengthMismatch);
+}
+if leaf_indices.iter().contains_dups() {
+    return Err(MerkleError::DuplicateIndices);
+}
 ```
-602|        let ciphertext = cipher.encrypt(nonce, payload).unwrap();
-```
-
-### Impact
-
-Any network attacker can crash a TLSNotary prover process by injecting a single corrupted TLS record. No authentication is required since the corruption happens at the record layer before handshake completion is verified.
 
 ---
 
-## Finding 2: Extended Master Secret (EMS) Extension Not Sent
+## Finding 2: Attacker-Controlled `MerkleProof.total_leaves` Field After Deserialization
 
 **Severity:** High
-**File:** `crates/tls/client/src/client/hs.rs`, line 218
-**Category:** Protocol Downgrade / Missing Security Feature
+**File:** `crates/core/src/merkle.rs`, lines 49–57, 96
+**Category:** Proof forgery / verification bypass via deserialized field manipulation
 
 ### Description
 
-The `ClientExtension::ExtendedMasterSecretRequest` extension is commented out in the ClientHello construction, meaning the client never requests EMS from the server. This is separate from the known "EMS negotiated but not applied" issue — here, EMS is never even *requested*.
+The `MerkleProof` struct contains a `total_leaves: usize` field that is serialized and deserialized alongside the proof. During verification (line 96), this attacker-controlled value is passed directly to the underlying `rs_merkle` verification:
 
-### Evidence
-
+```rust
+if !self
+    .proof
+    .verify(root.to_inner(), &indices, &hashes, self.total_leaves)
+{
+    return Err(MerkleError::MerkleProofVerificationFailed);
+}
 ```
-218|        //ClientExtension::ExtendedMasterSecretRequest,
-```
 
-The `using_ems` field is initialized to `false` in `start_handshake` (line 148 of the `ExpectServerHello` struct shows `using_ems: self.using_ems`), and it can only become `true` if the server acks it (line 80 of `tls12.rs`: `self.using_ems = server_hello.ems_support_acked()`). But since the client never sends the extension, a well-behaved server will never ack it.
+When the `MerkleProof` is deserialized from an attacker-provided `SubstringsProof` (via `TlsProof::deserialize()` in WASM), the `total_leaves` value is fully attacker-controlled.
 
 ### Attack Chain
 
-1. Client connects to a TLS 1.2 server without requesting EMS.
-2. The TLS 1.2 session is established without Extended Master Secret protection.
-3. An attacker who can observe the handshake can perform a Triple Handshake attack (CVE-2014-6593 class), potentially binding a client's session to a different server context.
-4. This is especially dangerous in the TLSNotary context where the master secret is derived via MPC — without EMS, the master secret derivation does not incorporate the full handshake transcript, making it possible to confuse session bindings.
+1. Attacker creates a legitimate proof, then modifies the serialized `total_leaves` value.
+2. The `rs_merkle` library's `MerkleProof::verify()` uses `total_leaves` to reconstruct the expected tree shape. By manipulating this value, the attacker may cause verification to pass with an incomplete or malformed proof for a different tree topology.
+3. While `rs_merkle` 1.4 does validate tree structure, the trust boundary is incorrectly drawn: `total_leaves` should be derived from the signed `SessionHeader`, not from the proof itself. The Notary signs the Merkle root but not the leaf count, so a prover who wants to present a subset of commitments as if they were the complete set could manipulate `total_leaves`.
 
-### Impact
+### Evidence
 
-Without EMS, TLS 1.2 connections are vulnerable to the well-known Triple Handshake attack. In the TLSNotary protocol, this could allow a malicious server to trick the prover into creating notarized proofs that are bound to a different session than intended.
+- `crates/core/src/merkle.rs:49-57` — `MerkleProof` struct with `total_leaves` as serialized field
+- `crates/core/src/merkle.rs:94-98` — `self.total_leaves` used directly in verification
+- `crates/core/src/proof/substrings.rs:306-308` — verification call site
+- `crates/core/src/merkle.rs:322` — test explicitly modifies `total_leaves` and expects failure, but the trust model issue remains
+
+### Recommendation
+
+The `total_leaves` count should be stored in or derived from the `SessionHeader` (which is signed by the Notary), rather than being stored in the `MerkleProof` itself. Alternatively, the verification flow should cross-check `total_leaves` against a trusted source.
 
 ---
 
-## Finding 3: MPC Backend Ignores `set_hs_hash_client_key_exchange` (EMS Seed Discarded)
+## Finding 3: WASM `HttpRequest` Header Name/Value Injection — No Validation at JS/Rust Boundary
+
+**Severity:** Medium
+**File:** `crates/wasm/src/types.rs`, lines 42–67
+**Category:** HTTP Header Injection
+
+### Description
+
+The `HttpRequest` struct accepts a `HashMap<String, Vec<u8>>` for headers from JavaScript. The `TryFrom<HttpRequest>` implementation passes header names and values directly to `hyper::Request::builder().header(name, value)` without any validation:
+
+```rust
+for (name, value) in value.headers {
+    builder = builder.header(name, value);
+}
+```
+
+The header values are `Vec<u8>`, allowing raw bytes. While hyper does perform some validation, accepting raw bytes from JavaScript at the WASM boundary means an attacker controlling the JS side can attempt to inject:
+- Header names containing `:`, spaces, or other invalid characters
+- Header values containing `\r\n` sequences for response splitting (though hyper blocks this)
+
+The `uri` field is also passed unchecked and could contain encoded path traversal sequences or CRLF injection attempts targeting the HTTP/1.1 request line.
+
+### Attack Chain
+
+1. Malicious JavaScript code constructs an `HttpRequest` with crafted header names/values (e.g., `"Host\r\nInjected-Header"` as a key).
+2. The WASM binding directly forwards these to hyper's request builder.
+3. While hyper's `HeaderName` and `HeaderValue` parsing provides some safety, the lack of validation at the trust boundary means the defense depends entirely on hyper's implementation details, and the error messages may leak internal state.
+
+### Evidence
+
+- `crates/wasm/src/types.rs:42-47` — `HttpRequest` struct with raw `HashMap<String, Vec<u8>>` headers
+- `crates/wasm/src/types.rs:54-56` — direct forwarding to hyper builder
+
+### Recommendation
+
+Validate header names and values at the WASM boundary before passing to hyper. Reject header names containing non-token characters and values containing `\r` or `\n`.
+
+---
+
+## Finding 4: `FuturesIo::poll_read` — Uninitialized Memory Exposure to AsyncRead Implementation
+
+**Severity:** Medium
+**File:** `crates/wasm/src/io.rs`, lines 66–86
+**Category:** Memory Safety — Uninitialized Memory Read
+
+### Description
+
+The `FuturesIo` adapter converts between `hyper::rt::Read` and `futures::AsyncRead`. In `poll_read`, it creates a mutable byte slice from `MaybeUninit<u8>` memory:
+
+```rust
+let buf_slice = unsafe {
+    slice::from_raw_parts_mut(buf.as_mut().as_mut_ptr() as *mut u8, buf.as_mut().len())
+};
+
+let n = match futures::AsyncRead::poll_read(self.project().inner, cx, buf_slice) {
+    Poll::Ready(Ok(n)) => n,
+    other => return other.map_ok(|_| ()),
+};
+```
+
+The safety comment says "buf_slice should only be written to," but the `futures::AsyncRead::poll_read` contract does not guarantee this. If the underlying `AsyncRead` implementation (the WebSocket stream `WsStream` in this case) reads from the buffer before writing to it, it would observe uninitialized memory. The struct's `new()` method documents this as an invariant but cannot enforce it at the type level.
+
+### Attack Chain
+
+1. If the `WsStream` or any future wrapper reads from `buf_slice` before writing, it would access uninitialized memory.
+2. In practice, `WsStream` from `ws_stream_wasm` writes into the buffer without reading, so this is currently safe. However, the unsound abstraction means any change to the underlying transport could silently introduce undefined behavior.
+3. In debug builds or with certain allocators, the uninitialized bytes could contain sensitive data from previous allocations.
+
+### Evidence
+
+- `crates/wasm/src/io.rs:72-74` — unsafe cast from `MaybeUninit<u8>` to `u8`
+- `crates/wasm/src/io.rs:24-26` — safety requirement documented but not enforced
+
+### Recommendation
+
+Use `ReadBuf` or `BorrowedBuf` approaches that zero-initialize the buffer, or use a wrapper that guarantees the inner reader never reads from the uninitialized portion. At minimum, zero the buffer before passing it.
+
+---
+
+## Finding 5: `SubstringsProof::verify()` — `opening.recover()` Panics on Length Mismatch Instead of Returning Error
+
+**Severity:** Medium
+**File:** `crates/core/src/commitment/blake3.rs`, lines 69–74; `crates/core/src/proof/substrings.rs`, line 280
+**Category:** Denial of Service via panic in verification path
+
+### Description
+
+During `SubstringsProof::verify()`, for each opening, `opening.recover(&encodings)` is called (line 280). Inside `Blake3Opening::recover()`, there is an assertion:
+
+```rust
+pub fn recover(&self, encodings: &[EncodedValue<Full>]) -> Blake3Commitment {
+    assert_eq!(
+        encodings.len(),
+        self.data.len(),
+        "encodings and data must have the same length"
+    );
+```
+
+The number of encodings is derived from the `CommitmentInfo.ranges` field (which comes from the deserialized proof), while `self.data.len()` comes from the `Blake3Opening.data` field (also from the deserialized proof). A crafted proof where `ranges` and `data` have inconsistent lengths will trigger this `assert_eq!` and panic.
+
+Although `SubstringsProof::verify()` does check `opening.data().len() != opened_len` at line 235, this check uses `opening.data()` (length of the opening data) against `ranges.len()` (sum of range lengths). The `recover()` call at line 280 checks `encodings.len()` (number of individual byte indices from range iteration) against `self.data.len()`. These are the same comparison **only if** `get_value_ids` produces one ID per byte in the ranges, which it does. So under normal operation this is redundant, but the panic path remains dangerous if any code path changes.
+
+### Attack Chain
+
+1. Attacker crafts a `SubstringsProof` where `CommitmentInfo.ranges` and `Blake3Opening.data` have subtly inconsistent lengths that bypass the check at line 235 (e.g., through edge cases in `RangeSet::len()` behavior).
+2. `Blake3Opening::recover()` panics, crashing the verifier process or WASM instance.
+
+### Evidence
+
+- `crates/core/src/commitment/blake3.rs:70-74` — assert_eq! in recover()
+- `crates/core/src/proof/substrings.rs:280` — caller site
+- `crates/core/src/proof/substrings.rs:234-236` — existing (potentially bypassable) check
+
+### Recommendation
+
+Replace `assert_eq!` in `recover()` with a `Result::Err` return. Never use panicking assertions in verification paths that process attacker-controlled input.
+
+---
+
+## Finding 6: `TranscriptSlice` Range/Data Length Mismatch Not Validated in `RedactedTranscript::new()`
+
+**Severity:** Medium
+**File:** `crates/core/src/transcript.rs`, lines 65–79
+**Category:** Logic bug — silent data corruption
+
+### Description
+
+`RedactedTranscript::new()` accepts `TranscriptSlice` values and copies their data into a buffer using:
+
+```rust
+pub fn new(len: usize, slices: Vec<TranscriptSlice>) -> Self {
+    let mut data = vec![0u8; len];
+    let mut auth = RangeSet::default();
+    for slice in slices {
+        data[slice.range()].copy_from_slice(slice.data());
+        auth = auth.union(&slice.range());
+    }
+```
+
+There is **no validation** that `slice.range().len() == slice.data().len()`. If these differ, `copy_from_slice` will panic at runtime. The `TranscriptSlice::new()` constructor also performs no validation:
+
+```rust
+pub fn new(range: Range<usize>, data: Vec<u8>) -> Self {
+    Self { range, data }
+}
+```
+
+This is called from `SubstringsProof::verify()` (lines 312-319) where the slices are constructed from the verified data. While the current caller constructs consistent slices, the public API of `TranscriptSlice` allows inconsistent construction.
+
+### Attack Chain
+
+1. If any code path constructs a `TranscriptSlice` where `range.len() != data.len()`, the `copy_from_slice` in `RedactedTranscript::new()` will panic.
+2. This is currently mitigated by the fact that `SubstringsProof::verify()` constructs slices from already-validated data. However, `TranscriptSlice::new()` is a public constructor that does not enforce this invariant.
+
+### Evidence
+
+- `crates/core/src/transcript.rs:65-71` — no length validation
+- `crates/core/src/transcript.rs:140-141` — public constructor without validation
+- `crates/core/src/proof/substrings.rs:312-319` — current (correct) usage
+
+### Recommendation
+
+Add a validation check in `TranscriptSlice::new()`:
+
+```rust
+pub fn new(range: Range<usize>, data: Vec<u8>) -> Self {
+    assert_eq!(range.len(), data.len(), "range and data length mismatch");
+    Self { range, data }
+}
+```
+
+Or better, return a `Result`.
+
+---
+
+## Finding 7: Merkle Tree Deserialization Accepts Arbitrary Leaf Count With No Upper Bound
+
+**Severity:** Medium
+**File:** `crates/core/src/merkle.rs`, lines 203–218
+**Category:** Denial of Service via resource exhaustion during deserialization
+
+### Description
+
+The `merkle_tree_deserialize` function deserializes a `Vec<u8>` of leaf hashes and constructs a full Merkle tree:
+
+```rust
+fn merkle_tree_deserialize<'de, D>(
+    deserializer: D,
+) -> Result<MerkleTree_rs_merkle<Sha256>, D::Error> {
+    let bytes: Vec<u8> = Vec::deserialize(deserializer)?;
+    if bytes.len() % 32 != 0 {
+        return Err(serde::de::Error::custom("leaves must be 32 bytes"));
+    }
+    let leaves: Vec<[u8; 32]> = bytes.chunks(32).map(|c| c.try_into().unwrap()).collect();
+    Ok(MerkleTree_rs_merkle::<Sha256>::from_leaves(leaves.as_slice()))
+}
+```
+
+There is no upper bound on the number of leaves. A malicious payload with millions of 32-byte leaves will cause `MerkleTree::from_leaves()` to build a full in-memory tree, consuming O(n) memory and O(n log n) CPU time. This is separate from the known bincode size limit issue — this is about the semantic layer not imposing its own limit.
+
+Note: `MerkleProof` deserialization similarly has no bound on proof size.
+
+### Attack Chain
+
+1. Attacker sends a serialized `NotarizedSession` or `TlsProof` containing a `MerkleTree` or `TranscriptCommitments` with an extremely large number of leaves.
+2. Deserialization allocates unbounded memory to build the Merkle tree.
+3. The WASM instance or verifier process runs out of memory and crashes.
+
+### Evidence
+
+- `crates/core/src/merkle.rs:203-218` — no size limit check
+- `crates/core/src/merkle.rs:125-133` — `merkle_proof_deserialize` similarly unbounded
+- `crates/wasm/src/types.rs:152-154` — WASM deserialize entry point
+
+### Recommendation
+
+Add a maximum leaf count check before constructing the tree:
+
+```rust
+const MAX_MERKLE_LEAVES: usize = 10_000;
+if leaves.len() > MAX_MERKLE_LEAVES {
+    return Err(serde::de::Error::custom("too many leaves"));
+}
+```
+
+---
+
+## Finding 8: `SubstringsProof::verify()` — `CommitmentInfo` Direction and Ranges Trusted From Deserialized Proof
 
 **Severity:** High
-**File:** `crates/tls/mpc/src/leader.rs`, lines 517-519
-**Category:** Missing Validation / Protocol Implementation Gap
+**File:** `crates/core/src/proof/substrings.rs`, lines 221–300
+**Category:** Proof forgery — attacker controls commitment metadata
 
 ### Description
 
-The MPC backend's implementation of `set_hs_hash_client_key_exchange` is a no-op — it silently discards the handshake hash that would be used as the EMS seed. Even if EMS were negotiated and the extension were sent, the MPC backend would never use it.
+In `SubstringsProof::verify()`, the `CommitmentInfo` (containing `ranges` and `direction`) is deserialized alongside each opening in the `openings` HashMap. This metadata is trusted for:
 
-### Evidence
+1. Determining the transcript direction (sent vs received) — line 241/248
+2. Computing range bounds checks — line 256–265
+3. Generating encoding IDs — line 269–275
+4. Placing data into the output buffer — line 288–299
 
-```
-517|    async fn set_hs_hash_client_key_exchange(&mut self, hash: Vec<u8>) -> Result<(), BackendError> {
-518|        Ok(())
-519|    }
-```
+The verification flow recovers the expected commitment hash using `opening.recover(&encodings)` (line 280), then verifies that hash is in the Merkle tree (line 306-308). However, the **encodings** are computed from the deserialized `CommitmentInfo.ranges` and `CommitmentInfo.direction` fields using `get_value_ids(&ranges, direction)` — these are used to derive the encoder output.
 
-Compare with the `RustCryptoBackend` in `crates/tls/client/src/backend/standard.rs` lines 313-316, which stores it:
-```
-313|    async fn set_hs_hash_client_key_exchange(&mut self, hash: Vec<u8>) -> Result<(), BackendError> {
-314|        self.ems_seed = Some(hash.to_vec());
-315|        Ok(())
-316|    }
-```
+If an attacker can craft a `CommitmentInfo` with different ranges/direction than what was originally committed, the recovered hash would differ from the Merkle tree leaf, and verification would fail. This means the Merkle inclusion proof acts as a binding mechanism for the commitment metadata.
 
-Similarly, `set_hs_hash_server_hello` in the MPC backend (lines 521-523) is also a no-op.
+However, the `CommitmentInfo` is not directly hashed into the commitment — only the *encoding values* derived from it are. The security relies on the fact that different `(ranges, direction)` tuples produce different encoding IDs, which produce different encodings, which produce different hashes. If an encoding collision could be found (two different `(ranges, direction)` pairs producing identical encoding sequences), the commitment metadata could be swapped.
 
 ### Attack Chain
 
-1. Even if the EMS extension request were un-commented, the MPC backend would not incorporate the handshake hash into the master secret derivation.
-2. The PRF-based master secret derivation in the MPC path would use only `client_random || server_random` as seed, not the full handshake hash.
-3. This silently downgrades security to non-EMS behavior even if both client and server believe EMS is active.
+1. Attacker finds two different `(ranges, direction)` tuples that, when processed through `get_value_ids()` → `EncodingId::new()` → `encoder.encode_by_type()`, produce identical encoding sequences.
+2. `EncodingId::new()` uses a 64-bit Blake3 hash (`u64::from_be_bytes(hash[..8])`), meaning collision resistance is only ~2^32 (birthday bound).
+3. With 2^32 trial IDs, the attacker can find a collision and swap `CommitmentInfo` to re-attribute data to a different direction or range.
 
-### Impact
+### Evidence
 
-The MPC backend has a structural inability to support EMS. This compounds with Finding 2 to make TLS 1.2 connections via the MPC path inherently vulnerable to Triple Handshake attacks.
+- `crates/core/src/lib.rs:41-48` — `EncodingId` uses only 64 bits of Blake3 (truncated)
+- `crates/core/src/proof/substrings.rs:269-275` — encoding generation from `CommitmentInfo`
+- `crates/core/src/transcript.rs:176-183` — `get_value_ids()` generates string IDs like `"tx/0"`, `"rx/0"`
+
+### Recommendation
+
+Use the full 256-bit Blake3 hash for encoding IDs instead of truncating to 64 bits. Alternatively, include the `CommitmentInfo` (ranges + direction) directly in the commitment hash computation so it is bound to the Merkle leaf.
 
 ---
 
-## Finding 4: `SessionHeader.verify()` Does Not Validate `sent_len` / `recv_len`
+## Finding 9: WASM `ProverConfig` — `.unwrap()` on Builder Calls Can Panic on Malformed JS Input
 
 **Severity:** Medium
-**File:** `crates/core/src/session/header.rs`, lines 59-80
-**Category:** Incomplete Verification / Proof Forgery
+**File:** `crates/wasm/src/prover/config.rs`, lines 26, 33; `crates/wasm/src/verifier/config.rs`, lines 25, 30
+**Category:** Denial of Service via panic on invalid configuration
 
 ### Description
 
-The `SessionHeader::verify()` method validates `time`, `merkle_root`, `encoder_seed`, `handshake_data`, and `server_public_key`, but does not validate the `sent_len` and `recv_len` fields against any externally supplied values.
+Both `ProverConfig` and `VerifierConfig` conversion implementations use `.unwrap()` on builder results:
 
-### Evidence
-
-```
-59|    pub fn verify(
-60|        &self,
-61|        time: u64,
-62|        server_public_key: &PublicKey,
-63|        root: &MerkleRoot,
-64|        encoder_seed: &[u8; 32],
-65|        handshake_data_decommitment: &Decommitment<HandshakeData>,
-66|    ) -> Result<(), SessionHeaderVerifyError> {
-67|        let ok_time = self.handshake_summary.time().abs_diff(time) <= 300;
-68|        let ok_root = &self.merkle_root == root;
-69|        let ok_encoder_seed = &self.encoder_seed == encoder_seed;
-70|        let ok_handshake_data = handshake_data_decommitment
-71|            .verify(self.handshake_summary.handshake_commitment())
-72|            .is_ok();
-73|        let ok_server_public_key = self.handshake_summary.server_public_key() == server_public_key;
-74|
-75|        if !(ok_time && ok_root && ok_encoder_seed && ok_handshake_data && ok_server_public_key) {
-76|            return Err(SessionHeaderVerifyError::InconsistentHeader);
-77|        }
-78|
-79|        Ok(())
-80|    }
+```rust
+// prover/config.rs
+let protocol_config = builder.build().unwrap();
+tlsn_prover::tls::ProverConfig::builder()
+    .id(value.id)
+    .server_dns(value.server_dns)
+    .protocol_config(protocol_config)
+    .build()
+    .unwrap()
 ```
 
-The `sent_len` and `recv_len` fields are part of the `SessionHeader` that gets signed by the Notary, and they are used by `SubstringsProof::verify()` (in `substrings.rs`, line 264) to bound-check proof ranges. However, the Prover's own `verify()` call does not check these against the actual transcript lengths.
+```rust
+// verifier/config.rs
+let config_validator = builder.build().unwrap();
+tlsn_verifier::tls::VerifierConfig::builder()
+    .id(value.id)
+    .protocol_config_validator(config_validator)
+    .build()
+    .unwrap()
+```
+
+These are called from `#[wasm_bindgen(constructor)]` methods, meaning they are directly invoked from JavaScript. If the builder fails (e.g., due to missing required fields, invalid `server_dns`, or conflicting configuration), the `.unwrap()` will panic and crash the WASM instance.
 
 ### Attack Chain
 
-1. A malicious Notary provides a `SessionHeader` with inflated `sent_len` or `recv_len`.
-2. The Prover calls `verify()`, which succeeds because it doesn't check these lengths.
-3. The `SubstringsProof::verify()` later uses these inflated lengths as bounds, potentially allowing proofs to reference out-of-bounds ranges.
-4. The verification buffers are allocated based on these lengths (`let mut sent = vec![0u8; header.sent_len()];`), so a malicious Notary could also cause excessive memory allocation.
-
-### Impact
-
-A malicious Notary could manipulate transcript length fields in the signed header, affecting downstream proof verification bounds and enabling memory exhaustion attacks.
-
----
-
-## Finding 5: Time Verification Uses Overly Broad 300-Second Window
-
-**Severity:** Medium
-**File:** `crates/core/src/session/header.rs`, line 67
-**Category:** Weak Validation
-
-### Description
-
-The `SessionHeader::verify()` method allows a 300-second (5-minute) window for time validation. This means the Notary can backdate or postdate the session timestamp by up to 5 minutes.
+1. JavaScript code (potentially malicious or buggy) calls `new Prover({id: "", server_dns: "", max_sent_data: 0})`.
+2. The builder may reject this configuration (empty server DNS, zero-size data limits).
+3. `.unwrap()` panics, crashing the WASM runtime.
 
 ### Evidence
 
-```
-67|        let ok_time = self.handshake_summary.time().abs_diff(time) <= 300;
-```
+- `crates/wasm/src/prover/config.rs:26,33` — unwrap on builder results
+- `crates/wasm/src/verifier/config.rs:25,30` — unwrap on builder results
 
-### Attack Chain
+### Recommendation
 
-1. A malicious Notary sets the session time to be 5 minutes in the future.
-2. The Prover verifies the header — the time check passes.
-3. The certificate chain is verified against the session time via `SessionInfo::verify()` in `proof/session.rs` line 122-126:
-   ```
-   UNIX_EPOCH + Duration::from_secs(handshake_summary.time())
-   ```
-4. With a 5-minute window, an attacker could potentially:
-   - Use a certificate that has just expired (by shifting time backwards).
-   - Use a certificate that hasn't yet become valid (by shifting time forwards).
-   - Create notarized proofs that appear to have occurred at a different time, undermining audit trails.
-
-### Impact
-
-The 5-minute tolerance could allow use of recently-expired or not-yet-valid certificates, and enables timestamp manipulation in notarized sessions.
-
----
-
-## Finding 6: `HandshakeData::verify()` Discards Verification Results
-
-**Severity:** Medium
-**File:** `crates/tls/core/src/handshake.rs`, lines 72 and 94
-**Category:** Incorrect Error Handling
-
-### Description
-
-The `HandshakeData::verify()` method uses `_ = verifier.verify_server_cert(...)` and `_ = verifier.verify_tls12_signature(...)`, explicitly discarding the `ServerCertVerified` and `HandshakeSignatureValid` marker types. While the `?` operator does propagate errors, the discarded return values are intended as compile-time proof that verification occurred (the "goto fail" pattern defense from `tls_core::verify`).
-
-### Evidence
-
-```
-72|        _ = verifier.verify_server_cert(
-73|            end_entity,
-74|            intermediates,
-75|            server_name,
-...
-84|            time,
-85|        )?;
-...
-94|        _ = verifier.verify_tls12_signature(
-95|            &message,
-96|            &self.server_cert_details().cert_chain()[0],
-97|            sig,
-98|        )?;
-```
-
-### Attack Chain
-
-This is a design weakness rather than a directly exploitable bug. The marker types (`ServerCertVerified`, `HandshakeSignatureValid`) are designed to be carried through the control flow to prove verification happened, as documented in `verify.rs` lines 34-41. Discarding them means a future refactor could accidentally remove the `?` error propagation without a compile error, silently skipping verification.
-
-Additionally, the `assertion()` constructors on these types are `pub`, meaning any code can create these markers without performing actual verification (as is done in `tls13.rs` line 336-337 for session resumption).
-
-### Impact
-
-Reduced defense-in-depth against accidental verification bypasses in future code changes. The public `assertion()` constructors also mean these marker types don't provide the compile-time guarantees they claim to.
-
----
-
-## Finding 7: `SubstringsProof::verify()` Does Not Validate Commitment Direction Consistency
-
-**Severity:** Medium
-**File:** `crates/core/src/proof/substrings.rs`, lines 221-300
-**Category:** Incomplete Verification
-
-### Description
-
-In `SubstringsProof::verify()`, the commitment `CommitmentInfo` includes a `direction` field that indicates whether data is from the sent or received transcript. However, the verification loop does not cross-check that the `direction` in the opening matches the `direction` that was originally committed to in the Merkle tree. The direction is part of the `CommitmentInfo` which is provided alongside the opening, but both come from the untrusted prover.
-
-### Evidence
-
-The `CommitmentInfo` containing `direction` is deserialized from the proof:
-```
-221|        for (id, (info, opening)) in openings {
-222|            let CommitmentInfo {
-223|                ranges, direction, ..
-224|            } = info;
-```
-
-The direction determines which transcript buffer receives the data and which encoding IDs are generated:
-```
-269|            let encodings = get_value_ids(&ranges, direction)
-270|                .map(|id| {
-271|                    header
-272|                        .encoder()
-273|                        .encode_by_type(EncodingId::new(&id).to_inner(), &ValueType::U8)
-274|                })
-275|                .collect::<Vec<_>>();
-```
-
-If the encoding IDs for sent vs received data happen to produce different values (which they should by design of `get_value_ids`), this provides *implicit* protection. However, if the encoding scheme doesn't strongly separate sent vs received IDs, a prover could claim received data as sent data or vice versa.
-
-### Attack Chain
-
-1. A malicious prover constructs a `SubstringsProof` with a `CommitmentInfo` that claims data from the "Sent" direction actually came from "Received" or vice versa.
-2. If encoding IDs for sent/received don't have domain separation, the Merkle proof could still validate.
-3. The verifier would then place received data into the sent transcript or vice versa.
-
-### Impact
-
-Could allow a prover to swap data between sent and received transcripts in the proof, potentially misattributing who said what in the TLS conversation.
-
----
-
-## Finding 8: Nonce Reuse Risk in StandardCrypto Encryption
-
-**Severity:** Medium
-**File:** `crates/tls/client/src/crypto/standard.rs`, lines 494-511
-**Category:** Cryptographic Weakness
-
-### Description
-
-The `StandardCrypto` encryption path uses a hardcoded explicit nonce `[0, 0, 0, 0, 0, 0, 0, 1]` for the `ClientFinished` handshake message (line 501). While the comment explains this is intentional for GC round-trip optimization, any other handshake message that happens to be encrypted (due to a state machine bug or protocol extension) would also use this same nonce, creating a nonce reuse vulnerability.
-
-### Evidence
-
-```
-494|                        match m.typ {
-495|                            ContentType::Handshake => {
-496|                                // In TLS 1.2 the only handshake message that needs to be
-497|                                // encrypted by the client is Client_Finished.
-498|
-499|                                // By fixing the explicit_nonce of Client_Finished, we
-500|                                // can save a round-trip in GC
-501|                                explicit_nonce = [0, 0, 0, 0, 0, 0, 0, 1];
-502|                            }
-503|                            ContentType::ApplicationData => {
-504|                                explicit_nonce = thread_rng().gen();
-505|                            }
-```
-
-Additionally, for `ApplicationData`, the nonce is generated via `thread_rng().gen()`, which produces random 8-byte nonces. While the collision probability for random nonces is low for a single session, AES-GCM's security guarantees degrade after ~2^32 encryptions with random nonces due to the birthday bound. The `RustCryptoBackend` in `backend/standard.rs` line 370 uses the sequence number instead (`&seq.to_be_bytes()`), which is the correct approach for TLS 1.2.
-
-### Attack Chain
-
-1. If a state machine bug causes multiple handshake messages to be encrypted, they all use the same fixed nonce `[0,0,0,0,0,0,0,1]`.
-2. With the same key and nonce, AES-GCM's keystream is identical, allowing XOR of ciphertexts to reveal the XOR of plaintexts.
-3. For ApplicationData, the random nonce approach is less dangerous but deviates from the TLS 1.2 specification which mandates unique explicit nonces per record.
-
-### Impact
-
-Nonce reuse under AES-GCM completely breaks confidentiality and can reveal authentication keys. The fixed handshake nonce is safe only if exactly one handshake message is ever encrypted, which relies on correct state machine behavior.
+Return `Result<JsProver, JsError>` from the constructor and propagate builder errors using `?` or `.map_err()`.
 
 ---
 
 ## Summary Table
 
-| # | Finding | Severity | File | Lines |
-|---|---------|----------|------|-------|
-| 1 | Decryption panic on auth failure | High | `crypto/standard.rs` | 660 |
-| 2 | EMS extension never sent | High | `client/hs.rs` | 218 |
-| 3 | MPC backend discards EMS seed | High | `mpc/leader.rs` | 517-519 |
-| 4 | `sent_len`/`recv_len` not verified | Medium | `session/header.rs` | 59-80 |
-| 5 | 300-second time validation window | Medium | `session/header.rs` | 67 |
-| 6 | Verification results discarded | Medium | `core/handshake.rs` | 72, 94 |
-| 7 | Commitment direction not cross-validated | Medium | `proof/substrings.rs` | 221-300 |
-| 8 | Nonce reuse risk in StandardCrypto | Medium | `crypto/standard.rs` | 494-511 |
+| # | Finding | Severity | File | Type |
+|---|---------|----------|------|------|
+| 1 | MerkleProof.verify() panics instead of returning errors | High | `merkle.rs:72-81` | DoS |
+| 2 | Attacker-controlled `total_leaves` in deserialized MerkleProof | High | `merkle.rs:49-57,96` | Proof integrity |
+| 3 | WASM HttpRequest header injection — no validation at JS/Rust boundary | Medium | `types.rs:42-67` | Injection |
+| 4 | FuturesIo::poll_read exposes uninitialized memory | Medium | `io.rs:66-86` | Memory safety |
+| 5 | Blake3Opening::recover() panics on length mismatch | Medium | `blake3.rs:69-74` | DoS |
+| 6 | TranscriptSlice range/data length not validated | Medium | `transcript.rs:65-79` | Logic bug |
+| 7 | Merkle tree deserialization accepts unbounded leaf count | Medium | `merkle.rs:203-218` | DoS |
+| 8 | EncodingId uses truncated 64-bit hash — birthday-bound collision | High | `lib.rs:41-48` | Proof forgery |
+| 9 | WASM config constructors panic on invalid input | Medium | `prover/config.rs`, `verifier/config.rs` | DoS |
